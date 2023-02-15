@@ -2,19 +2,28 @@
 #define __FEMU_FTL_H
 
 #include "../nvme.h"
+#include <openssl/sha.h>
 
 #define INVALID_PPA     (~(0ULL))
 #define INVALID_LPN     (~(0ULL))
 #define UNMAPPED_PPA    (~(0ULL))
+
+// 256GB = 4KB * (64*1024*1024)pages 
+// 64*100*1024, about 10% of all pages
+#define SEG_NUM_BITS 10
+#define NUM_SEG 1024
+#define NUM_BKT_PER_SEG 100
+#define NUM_ENTRY_PER_BKT 64
+
 
 enum {
     NAND_READ =  0,
     NAND_WRITE = 1,
     NAND_ERASE = 2,
 
-    NAND_READ_LATENCY = 40000,
+    NAND_READ_LATENCY = 25000,
     NAND_PROG_LATENCY = 200000,
-    NAND_ERASE_LATENCY = 2000000,
+    NAND_ERASE_LATENCY = 1500000,
 };
 
 enum {
@@ -62,11 +71,44 @@ struct ppa {
             uint64_t pl  : PL_BITS;
             uint64_t lun : LUN_BITS;
             uint64_t ch  : CH_BITS;
-            uint64_t rsv : 1;
+            uint64_t rsv : 1;       // secondary mapping flag, "1" indicates secmaptbl entry, otherwise ppa
         } g;
 
         uint64_t ppa;
     };
+};
+
+struct finger_entry {
+    unsigned char sha1[SHA_DIGEST_LENGTH];
+    struct ppa ppa;
+    uint8_t count; // reduntance count
+    // struct finger_entry *next;
+};
+
+struct bucket {
+    int number;
+    int nentries;
+    struct finger_entry first_entry[NUM_ENTRY_PER_BKT];
+    unsigned char max_sha1[SHA_DIGEST_LENGTH];
+    unsigned char min_sha1[SHA_DIGEST_LENGTH];
+    struct bucket *next;
+};
+
+struct segment {
+    int nbkts;
+    struct bucket *bkts;
+    struct bucket *cur_bkt;
+    
+};
+
+/* search sha1 in seg, return 1 and result written into lba if found, 
+    if not found, return 0 and insert sha1 into seg. */
+int search_in_segment(struct segment *seg, unsigned char *sha1, struct ppa *vba);
+
+
+struct ppa_ref {
+    struct ppa ppa;
+    uint8_t reference;
 };
 
 typedef int nand_sec_status_t;
@@ -199,9 +241,13 @@ struct ssd {
     struct ssdparams sp;
     struct ssd_channel *ch;
     struct ppa *maptbl; /* page level mapping table */
+    struct ppa_ref *secmaptbl; /* secondary mapping table */
+    uint64_t valid_vba_cnt;
+    uint64_t cur_vba;
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
     struct write_pointer wp;
     struct line_mgmt lm;
+    struct segment *seg;
 
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;

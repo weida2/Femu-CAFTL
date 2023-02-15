@@ -64,7 +64,7 @@ int backend_rw(SsdDramBackend *b, QEMUSGList *qsg, uint64_t *lbal, bool is_write
         }
     }
 
-    qemu_sglist_destroy(qsg);
+    // qemu_sglist_destroy(qsg);
 
     return 0;
 }
