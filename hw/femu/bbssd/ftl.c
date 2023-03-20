@@ -4,7 +4,7 @@
 #include <sys/time.h>
 #include <string.h>
 
-// #define FEMU_DEBUG_FTL
+// #define femu_log_FTL
 
 
 // struct timeval Start; /*only used for recording the cost*/
@@ -23,6 +23,23 @@
 // 	Cost += elapsed;
 // }
 
+
+static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa);
+static inline void set_rmap_ent(struct ssd *ssd, uint64_t lpn, struct ppa *ppa);
+static struct ppa get_new_vba(struct ssd *ssd);
+static void ssd_advance_vba(struct ssd *ssd);
+static void *ftl_thread(void *arg);
+static uint32_t fetch_pre_be(uint8_t *buffer);
+
+
+static uint32_t fetch_pre_be(uint8_t *buffer) {
+    const uint8_t b0 = buffer[0], b1 = buffer[1], b2 = buffer[2], b3 = buffer[3]; 
+
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3; 
+}
+
+
+
 static inline unsigned int get_seg_num(unsigned char *sha1) {
     return *(unsigned short *)sha1 >> (8*sizeof(unsigned short) - SEG_NUM_BITS);
 }
@@ -35,24 +52,46 @@ static inline int sha1_cmp(unsigned char *x, unsigned char *y) {
     if not found, return 0 and insert sha1 into seg. */
 static int search_in_bucket(struct bucket *p_bkt, unsigned char *sha1, struct ppa *vba) {
     struct finger_entry *p_entry = p_bkt->first_entry;
+    
+    // opm0: min and max sha1
     if (sha1_cmp(sha1, p_bkt->min_sha1) < 0 || 
     sha1_cmp(sha1, p_bkt->max_sha1) > 0 ) {
         return 0;
     }
-    // todo
-    for (; p_entry < p_bkt->first_entry+p_bkt->nentries; p_entry++) {
-        if (!sha1_cmp(sha1, p_entry->sha1)) {
-            vba->ppa = p_entry->ppa.ppa;
-            p_entry->count ++;  //
-            femu_debug("[search]: sha1 found in seg#%u,bkt#%d,entry#%ld\n",get_seg_num(sha1),p_bkt->number,p_entry-p_bkt->first_entry);
-            return 1;
+
+    bool opm1 = true;
+    
+    if (opm1) {
+    // opm1: binary search
+        int l = 0, r = p_bkt->nentries;
+        int mid = 0;
+        while (l <= r) {
+            mid = (l + r) / 2;
+            int check = sha1_cmp(sha1, p_entry[mid].sha1);
+            if (check < 0) r = mid - 1;
+            else if (check > 0) l = mid + 1;
+            else {
+                vba->ppa = p_entry[mid].vba.ppa;
+                p_entry[mid].count ++;  //
+                femu_log("[search]: sha1 found in seg#%u,bkt#%d,entry#%d\n",get_seg_num(sha1),p_bkt->number,mid);
+                return 1;
+            }
+        }
+    } else {
+        for (; p_entry < p_bkt->first_entry+p_bkt->nentries; p_entry++) {
+            if (!sha1_cmp(sha1, p_entry->sha1)) {
+                vba->ppa = p_entry->vba.ppa;
+                p_entry->count ++;  //
+                femu_debug("[search]: sha1 found in seg#%u,bkt#%d,entry#%ld\n",get_seg_num(sha1),p_bkt->number,p_entry-p_bkt->first_entry);
+                return 1;
+            }
         }
     }
     return 0;
 }
 
 static inline void set_entry(struct finger_entry *entry, unsigned char *sha1, struct ppa *vba, uint8_t count) {
-    entry->ppa.ppa = vba->ppa;
+    entry->vba.ppa = vba->ppa;
     entry->count = count;
     memcpy(entry->sha1, sha1, SHA_DIGEST_LENGTH);
 }
@@ -69,13 +108,21 @@ static int find_least_cnt_entry(struct bucket *bkt) {
     return res;
 }
 
-static void add_sha1_to_seg(struct segment *seg, unsigned char *sha1, struct ppa *vba) {
+static void add_sha1_to_seg(struct ssd *ssd, struct segment *seg, unsigned char *sha1, struct ppa *vba) {
     struct bucket *p_bkt = seg->cur_bkt;
+    struct ppa new_vba;
+    new_vba = get_new_vba(ssd);
+    ssd_advance_vba(ssd);
+    vba->ppa = new_vba.ppa;
+    femu_log("获得新的 vba->ppa: %lu", vba->ppa);
+
+    bool opm1 = true;
+
     if (seg->nbkts < NUM_BKT_PER_SEG ) {
         // seg not full,
         if (seg->nbkts == 0 || p_bkt->nentries >= NUM_ENTRY_PER_BKT) {
             // bkt full or no bkt, make a new one
-            femu_debug("[FGPRT]:make a new bkt\n");
+            femu_log("[FGPRT]:make a new bkt\n");
             struct bucket *new_bkt = g_malloc0(sizeof(struct bucket));
             new_bkt->nentries = 0;
             new_bkt->number = seg->nbkts;
@@ -99,9 +146,27 @@ static void add_sha1_to_seg(struct segment *seg, unsigned char *sha1, struct ppa
         }
         else {
             // bkt not full, jush add
-            femu_debug("[FGPRT]:add to bkt\n");
-            set_entry(p_bkt->first_entry+p_bkt->nentries, sha1, vba, 1);
-            p_bkt->nentries++;
+            femu_log("[FGPRT]:add to bkt\n");
+            
+            // optimization1 sort bpkt'entry
+            if (opm1) {
+                int i = 0;
+                for (i = 0; i < p_bkt->nentries; i++) {
+                    // find a insert idx
+                    if (sha1_cmp(sha1, p_bkt->first_entry[i].sha1) < 0) {
+                    for (int j = p_bkt->nentries; j >= i + 1; j--) {
+                            p_bkt->first_entry[j] = p_bkt->first_entry[j - 1];
+                    }
+                    break;
+                    }
+                }
+                set_entry(p_bkt->first_entry + i, sha1, vba, 1);
+                p_bkt->nentries++;
+            }else {
+                set_entry(p_bkt->first_entry+p_bkt->nentries, sha1, vba, 1);
+                p_bkt->nentries++;
+            }
+
             if (sha1_cmp(sha1, p_bkt->min_sha1) < 0) {
                 memcpy(p_bkt->min_sha1, sha1, SHA_DIGEST_LENGTH);
             }
@@ -112,7 +177,8 @@ static void add_sha1_to_seg(struct segment *seg, unsigned char *sha1, struct ppa
     }
     else {
         // all bkts full, select bkt in round-robin mode
-        femu_debug("[FGPRT]:all bkts full, select bkt in round-robin mode\n");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          
+        femu_log("[FGPRT]:all bkts full, select bkt in round-robin mode\n");
         p_bkt = seg->cur_bkt = seg->cur_bkt->next;
         
         // victimize the least counted entry
@@ -128,30 +194,50 @@ static void add_sha1_to_seg(struct segment *seg, unsigned char *sha1, struct ppa
     }
 }
 
-int search_in_segment(struct segment *seg, unsigned char *sha1, struct ppa *vba) {
+int search_in_segment(struct ssd *ssd, struct segment *seg, unsigned char *sha1, struct ppa *vba) {
     unsigned int n = get_seg_num(sha1);
-    femu_debug("[search]:seg_num=%d, there're %d bkts\n",n,seg[n].nbkts);
+    femu_log("[search]:seg_num=%d, there're %d bkts\n",n,seg[n].nbkts);
+
+    bool opm2 = false;
 
     struct segment *p_seg = seg + n;
     if (!p_seg->nbkts) {
-        add_sha1_to_seg(p_seg, sha1, vba);
+        add_sha1_to_seg(ssd, p_seg, sha1, vba);
         return 0;
     }
 
-    struct bucket *p_bkt = p_seg->cur_bkt;
-    for (int i=0; i<p_seg->nbkts; p_bkt=p_bkt->next,i++) {
-        if (search_in_bucket(p_bkt, sha1, vba)) {
+    // opm2 : sort seg'bkt, binary search seg'bkt
+    if (opm2 && p_seg->nbkts > 10) {
+        int l = 0, r = p_seg->nbkts;
+        int mid = 0;
+        struct bucket *check_bkt = p_seg->bkts;
+        while (l <= r) {
+            mid = (l + r) / 2;
+            check_bkt = p_seg->bkts;
+            for (int i = 0; i < mid; i++) check_bkt = check_bkt->next;
+            if (sha1_cmp(sha1, check_bkt->min_sha1) < 0) {
+                r = mid - 1;
+            }else if (sha1_cmp(sha1, check_bkt->min_sha1) > 0)l = mid + 1;
+            else break;
+        }
+        if (search_in_bucket(check_bkt, sha1, vba)) {
             return 1;
+        }      
+
+    } else {
+        struct bucket *p_bkt = p_seg->cur_bkt;
+        for (int i=0; i<p_seg->nbkts; p_bkt=p_bkt->next,i++) {
+            if (search_in_bucket(p_bkt, sha1, vba)) {
+                return 1;
+            }
         }
     }
-    add_sha1_to_seg(p_seg, sha1, vba);
+
+    add_sha1_to_seg(ssd, p_seg, sha1, vba);
     return 0;
 }
 
 
-static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa);
-static inline void set_rmap_ent(struct ssd *ssd, uint64_t lpn, struct ppa *ppa);
-static void *ftl_thread(void *arg);
 
 static inline bool should_gc(struct ssd *ssd)
 {
@@ -227,31 +313,45 @@ static inline void minus_secmaptbl_ref(struct ssd *ssd, struct ppa *vba)
 
 // get next vba of secmaptbl
 static void ssd_advance_vba(struct ssd *ssd) {
-    if (ssd->cur_vba + 1 < ssd->sp.tt_pgs/10) {
-        while (get_secmaptbl_ref(ssd, ssd->cur_vba) != 0 && ssd->cur_vba + 1 < ssd->sp.tt_pgs/10) {
+    ssd->cur_vba++;
+    if (get_secmaptbl_ref(ssd, ssd->cur_vba) == 0) {
+        //todo
+        // struct ppa ppa = get_secmaptbl_ent2(ssd, ssd->cur_vba)
+        // if (mapped_ppa(&ppa)) {
+        //     mark_page_invalid(ssd, &ppa);
+        // }
+        return;
+    }
+    while (ssd->cur_vba + 1 < ssd->sp.tt_pgs / 2) {
+        if (get_secmaptbl_ref(ssd, ssd->cur_vba) != 0) {
             ssd->cur_vba++;
         }
-    } else {
-        // find a empty vba entry from the beginning
-        for(uint64_t vbn=0; vbn<ssd->sp.tt_pgs/10; vbn++) {
-            if(get_secmaptbl_ref(ssd, vbn) == 0) {
-                // ref == 0, page invalid
-                struct ppa ppa =get_secmaptbl_ent2(ssd, vbn);
-                mark_page_invalid(ssd, &ppa);
-                ssd->valid_vba_cnt--;
-                ssd->cur_vba = vbn;
-                set_rmap_ent(ssd, INVALID_LPN, &ppa);
-            }
+        else return;
+    } 
+
+    // find a empty vba entry from the beginning
+    for(uint64_t vbn=0; vbn<ssd->sp.tt_pgs / 2; vbn++) {
+        if(get_secmaptbl_ref(ssd, vbn) == 0) {
+            // ref == 0, page invalid
+            ssd->cur_vba = vbn;
+            return;
         }
     }
+    femu_err("no empty vba!\n");
 }
 
-static struct ppa get_new_vba(struct ssd *ssd) {
-    struct ppa ppa;
-    ppa.ppa = ssd->cur_vba;
-    ppa.g.rsv = 1;
+static struct ppa get_new_vba(struct ssd *ssd)
+{
+    struct ppa vba;
+    // vba.g.ch = -1;
+    // vba.g.lun = -1;
+    // vba.g.pg = -1;
+    // vba.g.blk = -1;
+    // vba.g.pl = -1;
+    vba.g.rsv = 1;
+    vba.ppa = ssd->cur_vba;
     ssd->valid_vba_cnt++;
-    return ppa;
+    return vba;
 }
 
 static uint64_t ppa2pgidx(struct ssd *ssd, struct ppa *ppa)
@@ -467,11 +567,11 @@ static void ssd_init_params(struct ssdparams *spp)
 {
     spp->secsz = 512;
     spp->secs_per_pg = 8;
-    spp->pgs_per_blk = 512;
-    spp->blks_per_pl = 256; /* 256GB */
+    spp->pgs_per_blk = 256;
+    spp->blks_per_pl = 128; /* 4GB */
     spp->pls_per_lun = 2;
-    spp->luns_per_ch = 16;
-    spp->nchs = 16;
+    spp->luns_per_ch = 8;
+    spp->nchs = 4;
 
     spp->pg_rd_lat = NAND_READ_LATENCY;
     spp->pg_wr_lat = NAND_PROG_LATENCY;
@@ -592,6 +692,9 @@ static void ssd_init_maptbl(struct ssd *ssd)
     }
     ssd->valid_vba_cnt = 0;
     ssd->cur_vba = 0;
+
+    ssd->CrcCherry.crc_vec = g_malloc0(sizeof(struct Crccherry) * spp->tt_pgs / 10);
+    ssd->CrcCherry.idx = 0;
 }
 
 static void ssd_init_rmap(struct ssd *ssd)
@@ -1040,22 +1143,24 @@ static uint64_t ssd_read(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
 
     // status = nvme_io_cmd(n, &cmd, req);
     
-    NvmeRwCmd *rw = (NvmeRwCmd *)(&(req->cmd));
-    uint64_t slba = le64_to_cpu(rw->slba);
-    NvmeNamespace *ns = req->ns;
-    const uint8_t lba_index = NVME_ID_NS_FLBAS_INDEX(ns->id_ns.flbas);
-    const uint8_t data_shift = ns->id_ns.lbaf[lba_index].lbads;
-    uint64_t data_offset = slba << data_shift;
+    // NvmeRwCmd *rw = (NvmeRwCmd *)(&(req->cmd));
+    // uint64_t slba = le64_to_cpu(rw->slba);
+    // NvmeNamespace *ns = req->ns;
+    // const uint8_t lba_index = NVME_ID_NS_FLBAS_INDEX(ns->id_ns.flbas);
+    // const uint8_t data_shift = ns->id_ns.lbaf[lba_index].lbads;
+    // uint64_t data_offset = slba << data_shift;
     
-    QEMUSGList *qsg = &req->qsg;
-    int sg_cur_index = 0;
-    dma_addr_t sg_cur_byte = 0;
-    dma_addr_t cur_len;
-    // void *mb = n->mbe->logical_space;
+    // QEMUSGList *qsg = &req->qsg;
+    // int sg_cur_index = 0;
+    // dma_addr_t sg_cur_byte = 0;
+    // dma_addr_t cur_len;
+    // // void *mb = n->mbe->logical_space;
 
     
     /* normal IO read path */
+    // femu_log("即将进入normal IO path");
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        // femu_log("进入了");
         ppa = get_maptbl_ent(ssd, lpn);
         if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) {
             //printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
@@ -1067,20 +1172,20 @@ static uint64_t ssd_read(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
         // hash engine
 
         // get data from memory backend
-        assert(sg_cur_index < qsg->nsg);
-        cur_len = qsg->sg[sg_cur_index].len - sg_cur_byte;
+        // assert(sg_cur_index < qsg->nsg);
+        // cur_len = qsg->sg[sg_cur_index].len - sg_cur_byte;
         
         // unsigned char sha1[SHA_DIGEST_LENGTH];
         // SHA1(mb + data_offset, cur_len, sha1);
         
         // femu_log("[read]: lpn=%lu, SHA1=%lu,%lu\n", lpn, *(unsigned long*)sha1,*((unsigned long*)sha1+1));
 
-        sg_cur_byte += cur_len;
-        if (sg_cur_byte == qsg->sg[sg_cur_index].len) {
-            sg_cur_byte = 0;
-            ++sg_cur_index;
-        }
-        data_offset += cur_len;
+        // sg_cur_byte += cur_len;
+        // if (sg_cur_byte == qsg->sg[sg_cur_index].len) {
+        //     sg_cur_byte = 0;
+        //     ++sg_cur_index;
+        // }
+        // data_offset += cur_len;
 
 
         struct nand_cmd srd;
@@ -1091,23 +1196,37 @@ static uint64_t ssd_read(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
         maxlat = (sublat > maxlat) ? sublat : maxlat;
     }
     
-    qemu_sglist_destroy(qsg);
+    // qemu_sglist_destroy(qsg);
+    // femu_log("ssd_read end\n");
     // femu_log("ssd_read end\n");
     return maxlat;
 }
 
 static uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
 {
+    femu_log("ssd_write begin\n");
     uint64_t lba = req->slba;
     struct ssdparams *spp = &ssd->sp;
     int len = req->nlb;
     uint64_t start_lpn = lba / spp->secs_per_pg;
     uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
     struct ppa ppa, vba;
+    struct ppa new;
+    new = get_new_vba(ssd);
+    vba.ppa = new.ppa;
+    femu_log("[search]: 获得新的 vba 结果= %lu %d\n", vba.ppa, new.g.rsv);
+    ssd_advance_vba(ssd);
+
     uint64_t lpn;
     uint64_t curlat = 0, maxlat = 0;
     int r;
-    bool hash_flag = 0;
+    bool hash_flag = false;
+
+    bool opm3 = false, sample_st = false;
+    uint32_t sample_bytes = 0;
+    uint64_t sample_lpn = 0;
+
+    bool opm4 = false, crc_st = false;
 
     if (end_lpn >= spp->tt_pgs) {
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
@@ -1135,40 +1254,116 @@ static uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
     dma_addr_t cur_len;
     void *mb = n->mbe->logical_space;
 
+    femu_log("开始lpn:%lu, 结束:lpn:%lu\n", start_lpn, end_lpn);
+
+    // fetch pre 4 bytes as sample bytes
+    if (opm3) {
+        uint64_t tmp_data_offset = slba << data_shift;
+        
+        int tmp_sg_cur_index = 0;
+        dma_addr_t tmp_sg_cur_byte = 0;
+        dma_addr_t tmp_cur_len;
+        for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+            assert(tmp_sg_cur_index < qsg->nsg);
+
+            tmp_cur_len = qsg->sg[tmp_sg_cur_index].len - tmp_sg_cur_byte;
+            uint32_t tmp = fetch_pre_be((uint8_t *)(mb + tmp_data_offset));
+            if (sample_bytes < tmp) {
+                sample_bytes = tmp;
+                sample_lpn = lpn;
+            }
+            tmp_sg_cur_byte += tmp_cur_len;
+            if (tmp_sg_cur_byte == qsg->sg[tmp_sg_cur_index].len) {
+                tmp_sg_cur_byte = 0;
+                ++tmp_sg_cur_index;
+            }
+            tmp_data_offset += tmp_cur_len;
+        }
+
+        tmp_data_offset = slba << data_shift;
+        tmp_sg_cur_index = 0;
+        tmp_sg_cur_byte = 0;
+        tmp_cur_len = 0;
+
+        for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+            assert(tmp_sg_cur_index < qsg->nsg);
+            tmp_cur_len = qsg->sg[tmp_sg_cur_index].len - tmp_sg_cur_byte;
+
+
+            if (lpn == sample_lpn) {
+                struct ppa tmp_vba;
+                tmp_vba = get_new_vba(ssd);
+                unsigned char sha1[SHA_DIGEST_LENGTH];
+                SHA1(mb + data_offset, cur_len, sha1); 
+                int res = search_in_segment(ssd, ssd->seg, sha1, &tmp_vba); 
+                if (res) sample_st = true;
+                break;
+            }
+
+
+            tmp_sg_cur_byte += tmp_cur_len;
+            if (tmp_sg_cur_byte == qsg->sg[tmp_sg_cur_index].len) {
+                tmp_sg_cur_byte = 0;
+                ++tmp_sg_cur_index;
+            }
+            tmp_data_offset += tmp_cur_len;
+        }
+    }
+
+
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
 
+        // crc
+        if (opm4 && sample_st) {
+            uint64_t stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            u32 crc = crc32(0, mb + data_offset, cur_len);
+            uint64_t etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            femu_log("crc32 cost: %luns\n", etime-stime);
+            femu_log("[write]: lpn=%lu, crc32=%u\n", lpn, crc);
+
+            for (int i = 0; i < ssd->CrcCherry.idx; i++) {
+                if (ssd->CrcCherry.crc_vec[i] == crc) {
+                    crc_st = true;
+                    break;
+                }
+            }if (!crc_st) {
+                ssd->CrcCherry.crc_vec[ssd->CrcCherry.idx++] = crc;
+            }
+            
+        }
+
+        hash_flag = crc_st;
         
         if (hash_flag) {
             // get data from memory backend
             assert(sg_cur_index < qsg->nsg);
             cur_len = qsg->sg[sg_cur_index].len - sg_cur_byte;
             
-            // hash engine
 
-            // stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-            // crc32(0, mb + data_offset, cur_len);
-            // etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-            // femu_log("crc32 cost: %luns\n", etime-stime);
-            // femu_debug("[write]: lpn=%lu, crc32=%u\n", lpn, crc);u32 crc = 
+
+
             
+            // hash engine       
             unsigned char sha1[SHA_DIGEST_LENGTH];
             uint64_t stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
             SHA1(mb + data_offset, cur_len, sha1);
             uint64_t etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-            femu_debug("sha1 cost: %luns\n", etime-stime);
-            // femu_debug("[write]: lpn=%lu, SHA1=%lu,%lu\n", lpn, *(unsigned long*)sha1,*((unsigned long*)sha1+1));
+            femu_log("sha1 cost: %luns\n", etime-stime);
+            // femu_log("[write]: lpn=%lu, SHA1=%lu,%lu\n", lpn, *(unsigned long*)sha1,*((unsigned long*)sha1+1));
             
             // lookup hash
             stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-            int res = search_in_segment(ssd->seg, sha1, &vba);
+            int res = search_in_segment(ssd, ssd->seg, sha1, &vba);
             etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-            femu_debug("[search]: time=%luns, lpn=%lu, SHA1=%lu, res=%d, lba=%lu\n", etime-stime, lpn, *(unsigned long*)sha1,res,lba);
+            femu_log("[search]: time=%luns, lpn=%lu, SHA1=%lu, res=%d, lba=%lu\n", 
+            etime-stime, lpn, *(unsigned long*)sha1,res,lba);
+            femu_log("[search]: 返回 vba 结果= %lu\n", vba.ppa);
             
             if (res) {
                 // found, just map to secmaptbl
                 ppa = get_maptbl_ent(ssd, lpn);
                 if (ppa.ppa == vba.ppa) {
-                    femu_debug("[hit]: same lpn->vba\n");
+                    femu_log("[hit]: same lpn->vba\n");
                 }
                 else {
                     if (mapped_vba(&ppa)) {
@@ -1176,7 +1371,7 @@ static uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
                     }
                     set_maptbl_ent(ssd, lpn, &vba);
                     add_secmaptbl_res(ssd, &vba);
-                    femu_debug("[hit]:map%lu ---> vba%ld, ref=%d\n", lpn, (long)vba.ppa, get_secmaptbl_ref(ssd, vba.ppa));
+                    femu_log("[hit]:map%lu ---> vba%ld, ref=%d\n", lpn, (long)vba.ppa, get_secmaptbl_ref(ssd, vba.ppa));
                 }
             } 
             else {
@@ -1197,7 +1392,7 @@ static uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
                 /* new write */
                 ppa = get_new_page(ssd);
                 /* update secmaptbl */
-                vba= get_new_vba(ssd);
+                get_new_vba(ssd);
                 set_secmaptbl_ent(ssd, &vba, &ppa);
 
                 /* update maptbl */
@@ -1217,7 +1412,7 @@ static uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
                 /* get latency statistics */
                 curlat = ssd_advance_status(ssd, &ppa, &swr);
                 maxlat = (curlat > maxlat) ? curlat : maxlat;
-                femu_debug("[miss]:map%lu ---> vba%ld ---> ppa%lu, maxlat=%luns\n", lpn, (long)vba.ppa, ppa.ppa, maxlat);
+                femu_log("[miss]:map%lu ---> vba%lu ---> ppa%lu, maxlat=%luns\n", lpn, (long)vba.ppa, ppa.ppa, maxlat);
             }
         }
         else {
@@ -1260,6 +1455,8 @@ static uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
     }
     
     qemu_sglist_destroy(qsg);
+    femu_log("ssd_write end\n");
+    femu_log("\n\n\n\n------开始分割-------\n\n\n\n");
     return maxlat;
 }
 

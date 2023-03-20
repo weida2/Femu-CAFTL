@@ -63,7 +63,7 @@ enum {
 
 /* describe a physical page addr */
 struct ppa {
-    union {
+    // union {
         struct {
             uint64_t blk : BLK_BITS;
             uint64_t pg  : PG_BITS;
@@ -75,12 +75,20 @@ struct ppa {
         } g;
 
         uint64_t ppa;
-    };
+    // };
 };
+
+
+struct Crccherry {
+    unsigned int *crc_vec;
+    int idx;
+};
+
+
 
 struct finger_entry {
     unsigned char sha1[SHA_DIGEST_LENGTH];
-    struct ppa ppa;
+    struct ppa vba;
     uint8_t count; // reduntance count
     // struct finger_entry *next;
 };
@@ -103,12 +111,12 @@ struct segment {
 
 /* search sha1 in seg, return 1 and result written into lba if found, 
     if not found, return 0 and insert sha1 into seg. */
-int search_in_segment(struct segment *seg, unsigned char *sha1, struct ppa *vba);
+int search_in_segment(struct ssd *ssd, struct segment *seg, unsigned char *sha1, struct ppa *vba);
 
 
 struct ppa_ref {
     struct ppa ppa;
-    uint8_t reference;
+    uint16_t reference;
 };
 
 typedef int nand_sec_status_t;
@@ -248,6 +256,8 @@ struct ssd {
     struct write_pointer wp;
     struct line_mgmt lm;
     struct segment *seg;
+
+    struct Crccherry CrcCherry;
 
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;
