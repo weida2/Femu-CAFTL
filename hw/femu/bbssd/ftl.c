@@ -7,22 +7,6 @@
 // #define femu_log_FTL
 
 
-// struct timeval Start; /*only used for recording the cost*/
-// double Cost = 0;
-
-// static inline void cost_start(void) {
-// 	Cost = 0;
-// 	gettimeofday(&Start, NULL);
-// }
-
-// static inline void cost_end(void) {
-// 	double elapsed;
-// 	struct timeval costEnd;
-// 	gettimeofday(&costEnd, NULL);
-// 	elapsed = ((costEnd.tv_sec*1000000+costEnd.tv_usec)-(Start.tv_sec*1000000+Start.tv_usec));
-// 	Cost += elapsed;
-// }
-
 
 static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa);
 static inline void set_rmap_ent(struct ssd *ssd, uint64_t lpn, struct ppa *ppa);
@@ -50,28 +34,33 @@ static inline int sha1_cmp(unsigned char *x, unsigned char *y) {
 
 /* search sha1 in bkt, return 1 and result written into vba if found, 
     if not found, return 0 and insert sha1 into seg. */
-static int search_in_bucket(struct bucket *p_bkt, unsigned char *sha1, struct ppa *vba) {
+static int search_in_bucket(struct ssd *ssd, struct bucket *p_bkt, unsigned char *sha1, struct ppa *vba) {
     struct finger_entry *p_entry = p_bkt->first_entry;
     
     // opm0: min and max sha1
-    if (sha1_cmp(sha1, p_bkt->min_sha1) < 0 || 
-    sha1_cmp(sha1, p_bkt->max_sha1) > 0 ) {
+    if (ssd->opm0) {
+        if (sha1_cmp(sha1, p_bkt->min_sha1) < 0 || 
+        sha1_cmp(sha1, p_bkt->max_sha1) > 0 ) {
         return 0;
+        }
     }
 
-    bool opm1 = true;
+    bool opm1 = true && ssd->opm1;
     
     if (opm1) {
     // opm1: binary search
-        int l = 0, r = p_bkt->nentries;
+    //    femu_log("开启 bucket 内二进制搜索\n");
+        int l = 0, r = p_bkt->nentries - 1;
         int mid = 0;
         while (l <= r) {
+            ssd->cmp_cnt++;
             mid = (l + r) / 2;
             int check = sha1_cmp(sha1, p_entry[mid].sha1);
             if (check < 0) r = mid - 1;
             else if (check > 0) l = mid + 1;
             else {
                 vba->ppa = p_entry[mid].vba.ppa;
+                vba->g = p_entry[mid].vba.g;
                 p_entry[mid].count ++;  //
                 femu_log("[search]: sha1 found in seg#%u,bkt#%d,entry#%d\n",get_seg_num(sha1),p_bkt->number,mid);
                 return 1;
@@ -79,10 +68,12 @@ static int search_in_bucket(struct bucket *p_bkt, unsigned char *sha1, struct pp
         }
     } else {
         for (; p_entry < p_bkt->first_entry+p_bkt->nentries; p_entry++) {
+            ssd->cmp_cnt++;
             if (!sha1_cmp(sha1, p_entry->sha1)) {
                 vba->ppa = p_entry->vba.ppa;
+                vba->g = p_entry->vba.g;
                 p_entry->count ++;  //
-                femu_debug("[search]: sha1 found in seg#%u,bkt#%d,entry#%ld\n",get_seg_num(sha1),p_bkt->number,p_entry-p_bkt->first_entry);
+                femu_log("[search]: sha1 found in seg#%u,bkt#%d,entry#%ld\n",get_seg_num(sha1),p_bkt->number,p_entry-p_bkt->first_entry);
                 return 1;
             }
         }
@@ -92,6 +83,7 @@ static int search_in_bucket(struct bucket *p_bkt, unsigned char *sha1, struct pp
 
 static inline void set_entry(struct finger_entry *entry, unsigned char *sha1, struct ppa *vba, uint8_t count) {
     entry->vba.ppa = vba->ppa;
+    entry->vba.g = vba->g;
     entry->count = count;
     memcpy(entry->sha1, sha1, SHA_DIGEST_LENGTH);
 }
@@ -113,10 +105,11 @@ static void add_sha1_to_seg(struct ssd *ssd, struct segment *seg, unsigned char 
     struct ppa new_vba;
     new_vba = get_new_vba(ssd);
     ssd_advance_vba(ssd);
+    vba->g = new_vba.g;
     vba->ppa = new_vba.ppa;
-    femu_log("获得新的 vba->ppa: %lu", vba->ppa);
+    femu_log("获得新的 vba->ppa: %lu\n", vba->ppa);
 
-    bool opm1 = true;
+    bool opm1 = ssd->opm1;
 
     if (seg->nbkts < NUM_BKT_PER_SEG ) {
         // seg not full,
@@ -149,6 +142,7 @@ static void add_sha1_to_seg(struct ssd *ssd, struct segment *seg, unsigned char 
             femu_log("[FGPRT]:add to bkt\n");
             
             // optimization1 sort bpkt'entry
+            // bug this
             if (opm1) {
                 int i = 0;
                 for (i = 0; i < p_bkt->nentries; i++) {
@@ -166,6 +160,7 @@ static void add_sha1_to_seg(struct ssd *ssd, struct segment *seg, unsigned char 
                 set_entry(p_bkt->first_entry+p_bkt->nentries, sha1, vba, 1);
                 p_bkt->nentries++;
             }
+
 
             if (sha1_cmp(sha1, p_bkt->min_sha1) < 0) {
                 memcpy(p_bkt->min_sha1, sha1, SHA_DIGEST_LENGTH);
@@ -198,7 +193,7 @@ int search_in_segment(struct ssd *ssd, struct segment *seg, unsigned char *sha1,
     unsigned int n = get_seg_num(sha1);
     femu_log("[search]:seg_num=%d, there're %d bkts\n",n,seg[n].nbkts);
 
-    bool opm2 = false;
+    bool opm2 = ssd->opm2;
 
     struct segment *p_seg = seg + n;
     if (!p_seg->nbkts) {
@@ -207,7 +202,11 @@ int search_in_segment(struct ssd *ssd, struct segment *seg, unsigned char *sha1,
     }
 
     // opm2 : sort seg'bkt, binary search seg'bkt
+
+    // has a bug
     if (opm2 && p_seg->nbkts > 10) {
+
+        femu_log("开启 segment 内 bucket 排序\n");
         int l = 0, r = p_seg->nbkts;
         int mid = 0;
         struct bucket *check_bkt = p_seg->bkts;
@@ -220,14 +219,14 @@ int search_in_segment(struct ssd *ssd, struct segment *seg, unsigned char *sha1,
             }else if (sha1_cmp(sha1, check_bkt->min_sha1) > 0)l = mid + 1;
             else break;
         }
-        if (search_in_bucket(check_bkt, sha1, vba)) {
+        if (search_in_bucket(ssd, check_bkt, sha1, vba)) {
             return 1;
         }      
 
     } else {
         struct bucket *p_bkt = p_seg->cur_bkt;
         for (int i=0; i<p_seg->nbkts; p_bkt=p_bkt->next,i++) {
-            if (search_in_bucket(p_bkt, sha1, vba)) {
+            if (search_in_bucket(ssd, p_bkt, sha1, vba)) {
                 return 1;
             }
         }
@@ -314,6 +313,7 @@ static inline void minus_secmaptbl_ref(struct ssd *ssd, struct ppa *vba)
 // get next vba of secmaptbl
 static void ssd_advance_vba(struct ssd *ssd) {
     ssd->cur_vba++;
+    ssd->Shij++;
     if (get_secmaptbl_ref(ssd, ssd->cur_vba) == 0) {
         //todo
         // struct ppa ppa = get_secmaptbl_ent2(ssd, ssd->cur_vba)
@@ -322,7 +322,7 @@ static void ssd_advance_vba(struct ssd *ssd) {
         // }
         return;
     }
-    while (ssd->cur_vba + 1 < ssd->sp.tt_pgs / 2) {
+    while (ssd->cur_vba + 1 < ssd->sp.tt_pgs) {
         if (get_secmaptbl_ref(ssd, ssd->cur_vba) != 0) {
             ssd->cur_vba++;
         }
@@ -568,10 +568,10 @@ static void ssd_init_params(struct ssdparams *spp)
     spp->secsz = 512;
     spp->secs_per_pg = 8;
     spp->pgs_per_blk = 256;
-    spp->blks_per_pl = 128; /* 4GB */
+    spp->blks_per_pl = 128; /* 16GB */
     spp->pls_per_lun = 2;
     spp->luns_per_ch = 8;
-    spp->nchs = 4;
+    spp->nchs = 8;
 
     spp->pg_rd_lat = NAND_READ_LATENCY;
     spp->pg_wr_lat = NAND_PROG_LATENCY;
@@ -610,6 +610,8 @@ static void ssd_init_params(struct ssdparams *spp)
     spp->gc_thres_pcent_high = 0.95;
     spp->gc_thres_lines_high = (int)((1 - spp->gc_thres_pcent_high) * spp->tt_lines);
     spp->enable_gc_delay = true;
+
+
 
 
     check_params(spp);
@@ -685,15 +687,15 @@ static void ssd_init_maptbl(struct ssd *ssd)
         ssd->maptbl[i].ppa = UNMAPPED_PPA;
     }
 
-    ssd->secmaptbl = g_malloc0(sizeof(struct ppa_ref) * spp->tt_pgs / 10);
-    for (int i = 0; i < spp->tt_pgs/10; i++) {
+    ssd->secmaptbl = g_malloc0(sizeof(struct ppa_ref) * spp->tt_pgs / 1);
+    for (int i = 0; i < spp->tt_pgs/1; i++) {
         ssd->secmaptbl[i].ppa.ppa = UNMAPPED_PPA;
         ssd->secmaptbl[i].reference = 0;
     }
     ssd->valid_vba_cnt = 0;
     ssd->cur_vba = 0;
 
-    ssd->CrcCherry.crc_vec = g_malloc0(sizeof(struct Crccherry) * spp->tt_pgs / 10);
+    ssd->CrcCherry.crc_vec = g_malloc0(sizeof(struct Crccherry) * spp->tt_pgs / 1);
     ssd->CrcCherry.idx = 0;
 }
 
@@ -711,6 +713,15 @@ void ssd_init(FemuCtrl *n)
 {
     struct ssd *ssd = n->ssd;
     struct ssdparams *spp = &ssd->sp;
+
+    ssd->opm0 = false;
+    ssd->opm1 = false;
+    ssd->opm2 = false;
+    ssd->opm3 = false;
+    ssd->opm4 = false;
+    ssd->cmp_cnt = 0;
+    ssd->Yuqi = 0;
+    ssd->Shij = 0;
 
     ftl_assert(ssd);
 
@@ -1204,6 +1215,7 @@ static uint64_t ssd_read(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
 
 static uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
 {
+    femu_log("\n\n\n\n------开始分割-------\n\n\n\n");
     femu_log("ssd_write begin\n");
     uint64_t lba = req->slba;
     struct ssdparams *spp = &ssd->sp;
@@ -1211,22 +1223,22 @@ static uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
     uint64_t start_lpn = lba / spp->secs_per_pg;
     uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
     struct ppa ppa, vba;
-    struct ppa new;
-    new = get_new_vba(ssd);
-    vba.ppa = new.ppa;
-    femu_log("[search]: 获得新的 vba 结果= %lu %d\n", vba.ppa, new.g.rsv);
-    ssd_advance_vba(ssd);
+
+    // struct ppa new;
+    // new = get_new_vba(ssd);
+    // vba.ppa = new.ppa;
+    // femu_log("[search]: 获得新的 vba 结果= %lu 标志:%d\n", vba.ppa, new.g.rsv);
+
+    //ssd_advance_vba(ssd);
 
     uint64_t lpn;
     uint64_t curlat = 0, maxlat = 0;
     int r;
-    bool hash_flag = false;
+    bool hash_flag = true;
 
-    bool opm3 = false, sample_st = false;
-    uint32_t sample_bytes = 0;
-    uint64_t sample_lpn = 0;
+    bool opm3 = ssd->opm3;
 
-    bool opm4 = false, crc_st = false;
+    bool opm4 = ssd->opm4, crc_st = false;
 
     if (end_lpn >= spp->tt_pgs) {
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
@@ -1257,64 +1269,270 @@ static uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
     femu_log("开始lpn:%lu, 结束:lpn:%lu\n", start_lpn, end_lpn);
 
     // fetch pre 4 bytes as sample bytes
+    // 仍在存在bug 每个单元的样本采样都是选取第一个区间page
     if (opm3) {
-        uint64_t tmp_data_offset = slba << data_shift;
+
+        femu_log("开启 采样字节 32kb\n");
+
+        // unit write
+        uint64_t Unit_pages = Unit_size / 4;
+        for (lpn = start_lpn; lpn <= end_lpn; lpn += Unit_pages) {
+            cur_len = qsg->sg[sg_cur_index].len - sg_cur_byte;
+            int sample_st = 0;
+
+            // init 
+            uint64_t j_data_offset = data_offset;
+            int j_sg_cur_index = sg_cur_index;
+            dma_addr_t j_sg_cur_byte = sg_cur_byte;
+            dma_addr_t j_cur_len = cur_len;
+
+            uint32_t sample_bytes = 0;
+            uint64_t sample_lpn = 0;
+
+            // select sample_lpn sample_bytes
+            for (uint64_t j = lpn; j < lpn + Unit_pages && j <= end_lpn; j++) {
+                j_cur_len = qsg->sg[j_sg_cur_index].len - j_sg_cur_byte;
+                uint32_t tmp_bytes = fetch_pre_be((uint8_t *)(mb + j_data_offset));
+                if (sample_bytes < tmp_bytes) {
+                    sample_bytes = tmp_bytes;
+                    sample_lpn = lpn;
+                }
+                j_sg_cur_byte += j_cur_len;
+                if (j_sg_cur_byte == qsg->sg[j_sg_cur_index].len) {
+                    j_sg_cur_byte = 0;
+                    j_sg_cur_index++;
+                }
+                j_data_offset += j_cur_len;
+
+            }
+            femu_log("样本页面为:%lu,样本字节:%d\n", sample_lpn, sample_bytes);
+            j_data_offset = data_offset;
+            j_sg_cur_index = sg_cur_index;
+            j_sg_cur_byte = sg_cur_byte;
+            j_cur_len = cur_len;
+
+
+            uint64_t i_data_offset = data_offset;
+            int i_sg_cur_index = sg_cur_index;
+            dma_addr_t i_sg_cur_byte = sg_cur_byte;
+            dma_addr_t i_cur_len = cur_len;
+
+
+            for (uint64_t j = lpn; j < lpn + Unit_pages && j <= end_lpn; j++) {
+                j_cur_len = qsg->sg[j_sg_cur_index].len - j_sg_cur_byte;
+                if (j == sample_lpn) {
+
+                    unsigned char sha1[SHA_DIGEST_LENGTH];
+                    uint64_t stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                    SHA1(mb + j_data_offset, j_cur_len, sha1);
+                    uint64_t etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                    femu_log("sha1 cost: %luns\n", etime-stime);
+                    // femu_log("[write]: lpn=%lu, SHA1=%lu,%lu\n", lpn, *(unsigned long*)sha1,*((unsigned long*)sha1+1));
+                    
+                    // lookup hash
+                    stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                    sample_st = search_in_segment(ssd, ssd->seg, sha1, &vba);
+                    etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                    femu_log("[search]: time=%luns, lpn=%lu, SHA1=%lu, res=%d, lba=%lu\n", 
+                    etime-stime, j, *(unsigned long*)sha1,sample_st,lba);
+                    femu_log("[search]: 返回 vba 结果 = %lu\n", vba.ppa);
+
+
+                    if (sample_st) {
+                        n->dedup_pgs++;
+                        ppa = get_maptbl_ent(ssd, j);
+
+                        if (mapped_vba(&ppa)) {   // this lpn already write
+                            if (ppa.ppa == vba.ppa) {
+                                femu_log("[hit](mapP s): Same data in Same page lpn:%lu-> map:%lu\n",j, vba.ppa);
+                            }else { 
+                                minus_secmaptbl_ref(ssd, &ppa);
+                                add_secmaptbl_res(ssd, &vba);
+                                set_maptbl_ent(ssd, j, &vba);
+                                femu_log("[hit](mapP n):lpn:%lu ---> vba:%ld, ref=%d\n", j, (long)vba.ppa, get_secmaptbl_ref(ssd, vba.ppa));
+                            }
+                        }else {
+                            set_maptbl_ent(ssd, j, &vba);
+                            add_secmaptbl_res(ssd, &vba);
+                            femu_log("[hit](nmap):lpn:%lu ---> vba:%ld, ref=%d\n", j, (long)vba.ppa, get_secmaptbl_ref(ssd, vba.ppa));
+                        }      
+                        femu_log("[hit/miss]:命中: %lu, 未命中: %lu\n", n->dedup_pgs, n->no_dedup_pgs);
+
+
+
+
+                        for (uint64_t i = lpn; i < lpn + 8 && i <= end_lpn; i++) {
+                            
+                            i_cur_len = qsg->sg[i_sg_cur_index].len - i_sg_cur_byte;
+                            if (i == j) {
+                                i_sg_cur_byte += i_cur_len;
+                                if (i_sg_cur_byte == qsg->sg[i_sg_cur_index].len) {
+                                    i_sg_cur_byte = 0;
+                                    i_sg_cur_index++;
+                                }
+                                i_data_offset += i_cur_len;
+                                continue;
+                            }
+                            unsigned char sha1[SHA_DIGEST_LENGTH];
+                            uint64_t stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                            SHA1(mb + i_data_offset, i_cur_len, sha1);
+                            uint64_t etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                            femu_log("sha1 cost: %luns\n", etime-stime);
+                            // femu_log("[write]: lpn=%lu, SHA1=%lu,%lu\n", lpn, *(unsigned long*)sha1,*((unsigned long*)sha1+1));
+                            
+                            // lookup hash
+                            stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                            int res = search_in_segment(ssd, ssd->seg, sha1, &vba);
+                            etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                            femu_log("[search]: time=%luns, lpn=%lu, SHA1=%lu, res=%d, lba=%lu\n", 
+                            etime-stime, i, *(unsigned long*)sha1,res,lba);
+                            femu_log("[search]: 返回 vba 结果 = %lu\n", vba.ppa);
+                            
+                            if (res) {
+                                // found, just map to secmaptbl
+                                n->dedup_pgs++;
+                                ppa = get_maptbl_ent(ssd, i);
+
+                                if (mapped_vba(&ppa)) {   // this lpn already write
+                                    if (ppa.ppa == vba.ppa) {
+                                        femu_log("[hit](mapP s): Same data in Same page lpn:%lu-> map:%lu\n",i, vba.ppa);
+                                    }else { 
+                                        minus_secmaptbl_ref(ssd, &ppa);
+                                        add_secmaptbl_res(ssd, &vba);
+                                        set_maptbl_ent(ssd, i, &vba);
+                                        femu_log("[hit](mapP n):lpn:%lu ---> vba:%ld, ref=%d\n", i, (long)vba.ppa, get_secmaptbl_ref(ssd, vba.ppa));
+                                    }
+                                }else {
+                                    set_maptbl_ent(ssd, i, &vba);
+                                    add_secmaptbl_res(ssd, &vba);
+                                    femu_log("[hit](nmap):lpn:%lu ---> vba:%ld, ref=%d\n", i, (long)vba.ppa, get_secmaptbl_ref(ssd, vba.ppa));
+                                }
+                            } 
+                            else {
+                                // not found, map to secmaptbl and map secmaptbl to ppa
+                                n->no_dedup_pgs++;
+
+                                ppa = get_maptbl_ent(ssd, i);
+                                if (mapped_ppa(&ppa)) {
+                                    /* update old page information first */
+                                    mark_page_invalid(ssd, &ppa);   
+                                    set_rmap_ent(ssd, INVALID_LPN, &ppa);
+                                }
+                                else if (mapped_vba(&ppa)) {
+                                    /* update old page information first */
+                                    minus_secmaptbl_ref(ssd, &ppa);
+                                }
+
+                                /* new write */
+                                ppa = get_new_page(ssd);
+                                uint64_t pidx = ppa2pgidx(ssd, &ppa);
+
+
+                                /* update secmaptbl */
+                                //get_new_vba(ssd);
+                                //ssd_advance_vba(ssd);
+
+                                set_secmaptbl_ent(ssd, &vba, &ppa);
+
+                                /* update maptbl */
+                                set_maptbl_ent(ssd, i, &vba);
+                                /* update rmap */
+                                set_rmap_ent(ssd, i, &vba);
+                                mark_page_valid(ssd, &ppa);
+
+                                /* need to advance the write pointer here */
+                                ssd_advance_write_pointer(ssd);
+                
+
+                                struct nand_cmd swr;
+                                swr.type = USER_IO;
+                                swr.cmd = NAND_WRITE;
+                                swr.stime = req->stime;
+                                /* get latency statistics */
+                                curlat = ssd_advance_status(ssd, &ppa, &swr);
+                                maxlat = (curlat > maxlat) ? curlat : maxlat;
+                                femu_log("[miss]:lpn:%lu ---> vba:%lu ---> ppa:%lu(%lu), maxlat=%luns\n", i, (long)vba.ppa, ppa.ppa, pidx, maxlat);
+                            }
+                            femu_log("[hit/miss]:命中: %lu, 未命中: %lu\n", n->dedup_pgs, n->no_dedup_pgs);
+                        }
+                    }else {
+                        for (uint64_t i = 1; i <= Unit_pages - 1; i++) {
+                            n->no_dedup_pgs += 1;
+                            ssd_advance_vba(ssd);
+                        }
+
+                        ppa = get_maptbl_ent(ssd, j);
+                        if (mapped_ppa(&ppa)) {
+                            /* update old page information first */
+                            mark_page_invalid(ssd, &ppa);   
+                            set_rmap_ent(ssd, INVALID_LPN, &ppa);
+                        }
+                        else if (mapped_vba(&ppa)) {
+                            /* update old page information first */
+                            minus_secmaptbl_ref(ssd, &ppa);
+                        }
+
+                        /* new write */
+                        ppa = get_new_page(ssd);
+                        uint64_t pidx = ppa2pgidx(ssd, &ppa);
+
+
+                        /* update secmaptbl */
+                        //get_new_vba(ssd);
+                        //ssd_advance_vba(ssd);
+
+                        set_secmaptbl_ent(ssd, &vba, &ppa);
+
+                        /* update maptbl */
+                        set_maptbl_ent(ssd, j, &vba);
+                        /* update rmap */
+                        set_rmap_ent(ssd, j, &vba);
+                        mark_page_valid(ssd, &ppa);
+
+                        /* need to advance the write pointer here */
+                        ssd_advance_write_pointer(ssd);
         
-        int tmp_sg_cur_index = 0;
-        dma_addr_t tmp_sg_cur_byte = 0;
-        dma_addr_t tmp_cur_len;
-        for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-            assert(tmp_sg_cur_index < qsg->nsg);
 
-            tmp_cur_len = qsg->sg[tmp_sg_cur_index].len - tmp_sg_cur_byte;
-            uint32_t tmp = fetch_pre_be((uint8_t *)(mb + tmp_data_offset));
-            if (sample_bytes < tmp) {
-                sample_bytes = tmp;
-                sample_lpn = lpn;
+                        struct nand_cmd swr;
+                        swr.type = USER_IO;
+                        swr.cmd = NAND_WRITE;
+                        swr.stime = req->stime;
+                        /* get latency statistics */
+                        curlat = ssd_advance_status(ssd, &ppa, &swr);
+                        maxlat = (curlat > maxlat) ? curlat : maxlat;
+                        femu_log("[miss]:lpn:%lu ---> vba:%lu ---> ppa:%lu(%lu), maxlat=%luns\n", j, (long)vba.ppa, ppa.ppa, pidx, maxlat);
+                        femu_log("[hit/miss]:命中: %lu, 未命中: %lu\n", n->dedup_pgs, n->no_dedup_pgs);
+                    }
+
+                }
+
+                j_sg_cur_byte += j_cur_len;
+                if (j_sg_cur_byte == qsg->sg[j_sg_cur_index].len) {
+                    j_sg_cur_byte = 0;
+                    j_sg_cur_index++;
+                }
+                j_data_offset += j_cur_len;
+
             }
-            tmp_sg_cur_byte += tmp_cur_len;
-            if (tmp_sg_cur_byte == qsg->sg[tmp_sg_cur_index].len) {
-                tmp_sg_cur_byte = 0;
-                ++tmp_sg_cur_index;
-            }
-            tmp_data_offset += tmp_cur_len;
+            data_offset = j_data_offset;
+            sg_cur_index = j_sg_cur_index;
+            sg_cur_byte = j_sg_cur_byte;
+            cur_len = j_cur_len;
+            
         }
 
-        tmp_data_offset = slba << data_shift;
-        tmp_sg_cur_index = 0;
-        tmp_sg_cur_byte = 0;
-        tmp_cur_len = 0;
-
-        for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-            assert(tmp_sg_cur_index < qsg->nsg);
-            tmp_cur_len = qsg->sg[tmp_sg_cur_index].len - tmp_sg_cur_byte;
-
-
-            if (lpn == sample_lpn) {
-                struct ppa tmp_vba;
-                tmp_vba = get_new_vba(ssd);
-                unsigned char sha1[SHA_DIGEST_LENGTH];
-                SHA1(mb + data_offset, cur_len, sha1); 
-                int res = search_in_segment(ssd, ssd->seg, sha1, &tmp_vba); 
-                if (res) sample_st = true;
-                break;
-            }
-
-
-            tmp_sg_cur_byte += tmp_cur_len;
-            if (tmp_sg_cur_byte == qsg->sg[tmp_sg_cur_index].len) {
-                tmp_sg_cur_byte = 0;
-                ++tmp_sg_cur_index;
-            }
-            tmp_data_offset += tmp_cur_len;
-        }
     }
 
 
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        ssd->Yuqi++;
+
+        if (opm3) break;
+        cur_len = qsg->sg[sg_cur_index].len - sg_cur_byte;
 
         // crc
-        if (opm4 && sample_st) {
+        if (opm4 ) {
+            cur_len = qsg->sg[sg_cur_index].len - sg_cur_byte;
             uint64_t stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
             u32 crc = crc32(0, mb + data_offset, cur_len);
             uint64_t etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
@@ -1329,18 +1547,14 @@ static uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
             }if (!crc_st) {
                 ssd->CrcCherry.crc_vec[ssd->CrcCherry.idx++] = crc;
             }
-            
+            hash_flag = crc_st;
         }
 
-        hash_flag = crc_st;
+
         
         if (hash_flag) {
             // get data from memory backend
             assert(sg_cur_index < qsg->nsg);
-            cur_len = qsg->sg[sg_cur_index].len - sg_cur_byte;
-            
-
-
 
             
             // hash engine       
@@ -1357,27 +1571,32 @@ static uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
             etime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
             femu_log("[search]: time=%luns, lpn=%lu, SHA1=%lu, res=%d, lba=%lu\n", 
             etime-stime, lpn, *(unsigned long*)sha1,res,lba);
-            femu_log("[search]: 返回 vba 结果= %lu\n", vba.ppa);
+            femu_log("[search]: 返回 vba 结果 = %lu\n", vba.ppa);
             
             if (res) {
                 // found, just map to secmaptbl
+                n->dedup_pgs++;
                 ppa = get_maptbl_ent(ssd, lpn);
-                if (ppa.ppa == vba.ppa) {
-                    femu_log("[hit]: same lpn->vba\n");
-                }
-                else {
-                    if (mapped_vba(&ppa)) {
+
+                if (mapped_vba(&ppa)) {   // this lpn already write
+                    if (ppa.ppa == vba.ppa) {
+                        femu_log("[hit](mapP s): Same data in Same page lpn:%lu-> map:%lu\n",lpn, vba.ppa);
+                    }else { 
                         minus_secmaptbl_ref(ssd, &ppa);
+                        add_secmaptbl_res(ssd, &vba);
+                        set_maptbl_ent(ssd, lpn, &vba);
+                        femu_log("[hit](mapP n):lpn:%lu ---> vba:%ld, ref=%d\n", lpn, (long)vba.ppa, get_secmaptbl_ref(ssd, vba.ppa));
                     }
+                }else {
                     set_maptbl_ent(ssd, lpn, &vba);
                     add_secmaptbl_res(ssd, &vba);
-                    femu_log("[hit]:map%lu ---> vba%ld, ref=%d\n", lpn, (long)vba.ppa, get_secmaptbl_ref(ssd, vba.ppa));
+                    femu_log("[hit](nmap):lpn:%lu ---> vba:%ld, ref=%d\n", lpn, (long)vba.ppa, get_secmaptbl_ref(ssd, vba.ppa));
                 }
             } 
             else {
                 // not found, map to secmaptbl and map secmaptbl to ppa
-                
-                // old ppa
+                n->no_dedup_pgs++;
+
                 ppa = get_maptbl_ent(ssd, lpn);
                 if (mapped_ppa(&ppa)) {
                     /* update old page information first */
@@ -1391,8 +1610,13 @@ static uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
 
                 /* new write */
                 ppa = get_new_page(ssd);
+                uint64_t pidx = ppa2pgidx(ssd, &ppa);
+
+
                 /* update secmaptbl */
-                get_new_vba(ssd);
+                //get_new_vba(ssd);
+                //ssd_advance_vba(ssd);
+
                 set_secmaptbl_ent(ssd, &vba, &ppa);
 
                 /* update maptbl */
@@ -1403,7 +1627,7 @@ static uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
 
                 /* need to advance the write pointer here */
                 ssd_advance_write_pointer(ssd);
-                ssd_advance_vba(ssd);
+ 
 
                 struct nand_cmd swr;
                 swr.type = USER_IO;
@@ -1412,8 +1636,10 @@ static uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
                 /* get latency statistics */
                 curlat = ssd_advance_status(ssd, &ppa, &swr);
                 maxlat = (curlat > maxlat) ? curlat : maxlat;
-                femu_log("[miss]:map%lu ---> vba%lu ---> ppa%lu, maxlat=%luns\n", lpn, (long)vba.ppa, ppa.ppa, maxlat);
+                femu_log("[miss]:lpn:%lu ---> vba:%lu ---> ppa:%lu(%lu), maxlat=%luns\n", lpn, (long)vba.ppa, ppa.ppa, pidx, maxlat);
             }
+            femu_log("[hit/miss]:命中: %lu, 未命中: %lu\n", n->dedup_pgs, n->no_dedup_pgs);
+
         }
         else {
             // normal write
@@ -1456,7 +1682,7 @@ static uint64_t ssd_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
     
     qemu_sglist_destroy(qsg);
     femu_log("ssd_write end\n");
-    femu_log("\n\n\n\n------开始分割-------\n\n\n\n");
+
     return maxlat;
 }
 

@@ -1318,6 +1318,10 @@ typedef struct FemuCtrl {
 
     int64_t         nr_tt_ios;
     int64_t         nr_tt_late_ios;
+
+    int64_t         dedup_pgs;
+    int64_t         no_dedup_pgs;
+
     bool            print_log;
 
     uint8_t         multipoller_enabled;
@@ -1486,6 +1490,7 @@ static inline uint16_t nvme_check_mdts(FemuCtrl *n, size_t len)
 #define femu_debug(fmt, ...) \
     do { } while (0)
 #endif
+
 
 #define femu_err(fmt, ...) \
     do { fprintf(stderr, "[FEMU] Err: " fmt, ## __VA_ARGS__); } while (0)

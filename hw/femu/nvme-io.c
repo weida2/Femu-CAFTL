@@ -63,7 +63,6 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
         QTAILQ_REMOVE(&sq->req_list, req, entry);
         memset(&req->cqe, 0, sizeof(req->cqe));
         /* Coperd: record req->stime at earliest convenience */
-        req->expire_time = req->stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         req->cqe.cid = cmd.cid;
         req->cmd_opcode = cmd.opcode;
         memcpy(&req->cmd, &cmd, sizeof(NvmeCmd));
@@ -73,6 +72,9 @@ static void nvme_process_sq_io(void *opaque, int index_poller)
         }
 
         status = nvme_io_cmd(n, &cmd, req);
+
+        req->expire_time = req->stime = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
         if (1 && status == NVME_SUCCESS) {
             req->status = status;
 
@@ -162,8 +164,8 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
         n->nr_tt_ios++;
         if (now - req->expire_time >= 20000) {
             n->nr_tt_late_ios++;
-            if (n->print_log) {
-                femu_debug("%s,diff,pq.count=%lu,%" PRId64 ", %lu/%lu\n",
+            if (n->nr_tt_late_ios % 10000 == 0 || n->print_log) {
+                femu_log("%s,diff,pq.count=%lu,%" PRId64 ", %lu/%lu\n",
                            n->devname, pqueue_size(pq), now - req->expire_time,
                            n->nr_tt_late_ios, n->nr_tt_ios);
             }

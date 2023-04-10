@@ -15,15 +15,16 @@
 #define NUM_BKT_PER_SEG 100
 #define NUM_ENTRY_PER_BKT 64
 
+#define Unit_size 32
 
 enum {
     NAND_READ =  0,
     NAND_WRITE = 1,
     NAND_ERASE = 2,
 
-    NAND_READ_LATENCY = 25000,
-    NAND_PROG_LATENCY = 200000,
-    NAND_ERASE_LATENCY = 1500000,
+    NAND_READ_LATENCY = 40000,
+    NAND_PROG_LATENCY = 250000,
+    NAND_ERASE_LATENCY = 2000000,
 };
 
 enum {
@@ -51,6 +52,15 @@ enum {
     FEMU_RESET_ACCT = 5,
     FEMU_ENABLE_LOG = 6,
     FEMU_DISABLE_LOG = 7,
+
+    FEMU_RESET_FINGERSTORE = 8,
+
+    FEMU_OPM0 = 14,
+    FEMU_OPM1 = 10,
+    FEMU_OPM2 = 11,
+    FEMU_OPM3 = 12,
+    FEMU_OPM4 = 13,
+    FEMU_CNT = 15,
 };
 
 
@@ -256,6 +266,16 @@ struct ssd {
     struct write_pointer wp;
     struct line_mgmt lm;
     struct segment *seg;
+
+    bool opm0;
+    bool opm1;
+    bool opm2;
+    bool opm3;
+    bool opm4;
+    uint64_t cmp_cnt;
+
+    uint64_t Yuqi;
+    uint64_t Shij;
 
     struct Crccherry CrcCherry;
 

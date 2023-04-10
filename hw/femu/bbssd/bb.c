@@ -52,19 +52,108 @@ static void bb_flip(FemuCtrl *n, NvmeCmd *cmd)
         femu_log("%s,FEMU Delay Emulation [Disabled]!\n", n->devname);
         break;
     case FEMU_RESET_ACCT:
+        femu_log("清空前设备: %s的重删计数,清空前重删page: %lu, 未重删page: %lu, 总io: %lu\n",
+        n->devname, n->dedup_pgs, n->no_dedup_pgs, n->nr_tt_ios);
+
         n->nr_tt_ios = 0;
         n->nr_tt_late_ios = 0;
+
+        n->dedup_pgs = 0;
+        n->no_dedup_pgs = 0;
+
+        femu_log("清空前设备: %s的重删计数,清空前重删page: %lu, 未重删page: %lu, 总io: %lu\n",
+        n->devname, n->dedup_pgs, n->no_dedup_pgs, n->nr_tt_ios);
+
+
         femu_log("%s,Reset tt_late_ios/tt_ios,%lu/%lu\n", n->devname,
                 n->nr_tt_late_ios, n->nr_tt_ios);
+
+
+
         break;
     case FEMU_ENABLE_LOG:
         n->print_log = true;
+
         femu_log("%s,Log print [Enabled]!\n", n->devname);
         break;
     case FEMU_DISABLE_LOG:
         n->print_log = false;
         femu_log("%s,Log print [Disabled]!\n", n->devname);
         break;
+    case FEMU_RESET_FINGERSTORE:
+        g_free(ssd->seg);
+        ssd->seg = g_malloc0(sizeof(struct segment) * NUM_SEG);
+        for (int i = 0; i < NUM_SEG; i++) {
+            ssd->seg[i].nbkts = 0;
+            ssd->seg[i].bkts = NULL;
+            ssd->seg[i].cur_bkt = NULL;
+        }
+
+        struct ssdparams *spp = &ssd->sp;
+
+        ssd->maptbl = g_malloc0(sizeof(struct ppa) * spp->tt_pgs);
+        for (int i = 0; i < spp->tt_pgs; i++) {
+            ssd->maptbl[i].ppa = UNMAPPED_PPA;
+        }
+
+        ssd->secmaptbl = g_malloc0(sizeof(struct ppa_ref) * spp->tt_pgs / 1);
+        for (int i = 0; i < spp->tt_pgs/1; i++) {
+            ssd->secmaptbl[i].ppa.ppa = UNMAPPED_PPA;
+            ssd->secmaptbl[i].reference = 0;
+        }
+        ssd->valid_vba_cnt = 0;
+        ssd->cur_vba = 0;  
+        ssd->cmp_cnt = 0;
+        ssd->Yuqi = 0;
+        ssd->Shij = 0;
+
+        femu_log("重置指纹库 映射表\n");
+
+        break;
+    case FEMU_OPM0:
+        bool st0 = ssd->opm0;
+        ssd->opm0 = !st0;
+        if (ssd->opm0)
+            femu_log("优化0打开\n");
+        else   
+            femu_log("优化0关闭\n");            
+        break;   
+    case FEMU_OPM1:
+        bool st1 = ssd->opm1;
+        ssd->opm1 = !st1;
+        if (ssd->opm1)
+            femu_log("优化1打开\n");
+        else   
+            femu_log("优化1关闭\n");            
+        break;    
+    case FEMU_OPM2:
+        bool st2 = ssd->opm2;
+        ssd->opm2 = !st2;
+        if (ssd->opm2)
+            femu_log("优化2打开\n");
+        else   
+            femu_log("优化2关闭\n");  
+        break;    
+    case FEMU_OPM3:
+        bool st3 = ssd->opm3;
+        ssd->opm3 = !st3;
+        if (ssd->opm3)
+            femu_log("优化3打开\n");
+        else   
+            femu_log("优化3关闭\n");  
+        break;    
+    case FEMU_OPM4:
+        bool st4 = ssd->opm4;
+        ssd->opm4 = !st4;
+        if (ssd->opm4)
+            femu_log("优化4打开\n");
+        else   
+            femu_log("优化4关闭\n");  
+        break;    
+    case FEMU_CNT:
+        femu_log("comparison cnt:%lu\n", ssd->cmp_cnt);
+        femu_log("Yuqi: %lu, Shij: %lu\n", ssd->Yuqi, ssd->Shij);
+        break;   
     default:
         printf("FEMU:%s,Not implemented flip cmd (%lu)\n", n->devname, cdw10);
     }
