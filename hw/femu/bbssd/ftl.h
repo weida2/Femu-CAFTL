@@ -7,6 +7,7 @@
 #define INVALID_PPA     (~(0ULL))
 #define INVALID_LPN     (~(0ULL))
 #define UNMAPPED_PPA    (~(0ULL))
+#define UNMAPPED_VBA    (~(0ULL))
 
 // 256GB = 4KB * (64*1024*1024)pages 
 // 64*100*1024, about 10% of all pages
@@ -22,9 +23,9 @@ enum {
     NAND_WRITE = 1,
     NAND_ERASE = 2,
 
-    NAND_READ_LATENCY = 40000,
-    NAND_PROG_LATENCY = 250000,
-    NAND_ERASE_LATENCY = 2000000,
+    NAND_READ_LATENCY = 25000,
+    NAND_PROG_LATENCY = 200000,
+    NAND_ERASE_LATENCY = 1500000,
 };
 
 enum {
@@ -91,7 +92,7 @@ struct ppa {
 
 struct Crccherry {
     unsigned int *crc_vec;
-    int idx;
+    uint32_t idx;
 };
 
 
