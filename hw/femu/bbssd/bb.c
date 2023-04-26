@@ -21,6 +21,15 @@ static void bb_init(FemuCtrl *n, Error **errp)
     ssd->ssdname = (char *)n->devname;
     femu_debug("Starting FEMU in Blackbox-SSD mode ...\n");
     ssd_init(n);
+
+
+    // debug
+    for (int i = 0; i < ssd->sp.nchs; i++) {
+        for (int j = 0; j < ssd->sp.luns_per_ch; j++) {
+            femu_log("[time_cnt]ch:%d,lun:%d,next_lun_atime:%lu\n",
+            i,j, ssd->ch[i].lun[j].next_lun_avail_time);
+        }
+    }
 }
 
 static void bb_flip(FemuCtrl *n, NvmeCmd *cmd)
@@ -101,11 +110,21 @@ static void bb_flip(FemuCtrl *n, NvmeCmd *cmd)
             ssd->secmaptbl[i].ppa.ppa = UNMAPPED_PPA;
             ssd->secmaptbl[i].reference = 0;
         }
+
         ssd->valid_vba_cnt = 0;
         ssd->cur_vba = 0;  
         ssd->cmp_cnt = 0;
         ssd->Yuqi = 0;
         ssd->Shij = 0;
+
+        ssd->sha1_time = 0;
+        ssd->sha1_cnt = 0;
+        ssd->avg_search_time = 0;
+        ssd->avg_search_cnt = 0;
+        ssd->hit_search_time = 0;
+        ssd->hit_search_cnt = 0;
+        ssd->not_hit_time = 0;
+        ssd->not_hit_cnt = 0;
 
         femu_log("重置指纹库 映射表\n");
 
@@ -153,6 +172,20 @@ static void bb_flip(FemuCtrl *n, NvmeCmd *cmd)
     case FEMU_CNT:
         femu_log("comparison cnt:%lu\n", ssd->cmp_cnt);
         femu_log("Yuqi: %lu, Shij: %lu\n", ssd->Yuqi, ssd->Shij);
+        femu_log("ttline(earse blk): %d, free line(earse block) cnt: %d\n",ssd->lm.tt_lines, ssd->lm.free_line_cnt);
+
+        for (int i = 0; i < ssd->sp.nchs; i++) {
+            for (int j = 0; j < ssd->sp.luns_per_ch; j++) {
+                femu_log("[time_cnt]ch:%d,lun:%d,next_lun_atime:%lu\n",
+                i,j, ssd->ch[i].lun[j].next_lun_avail_time);
+            }
+        }
+
+        femu_log("sha1_time: %lu, sha1_cnt: %lu\n", ssd->sha1_time, ssd->sha1_cnt);
+        femu_log("avg_search_time: %lu, avg_search_cnt: %lu\n", ssd->avg_search_time, ssd->avg_search_cnt);
+        femu_log("hit_search_time: %lu, hit_search_cnt: %lu\n", ssd->hit_search_time, ssd->hit_search_cnt);
+        femu_log("not_hit_sr_time: %lu, not_hit_sr_cnt: %lu\n", ssd->not_hit_time, ssd->not_hit_cnt);
+
         break;   
     default:
         printf("FEMU:%s,Not implemented flip cmd (%lu)\n", n->devname, cdw10);

@@ -278,6 +278,21 @@ struct ssd {
     uint64_t Yuqi;
     uint64_t Shij;
 
+    uint64_t sha1_time;
+    uint64_t sha1_cnt;
+
+    uint64_t avg_search_time;
+    uint64_t avg_search_cnt;
+    
+    uint64_t hit_search_time;
+    uint64_t hit_search_cnt;
+
+    uint64_t not_hit_time;
+    uint64_t not_hit_cnt;
+    
+    uint64_t total_lat;
+
+
     struct Crccherry CrcCherry;
 
     /* lockless ring for communication with NVMe IO thread */
